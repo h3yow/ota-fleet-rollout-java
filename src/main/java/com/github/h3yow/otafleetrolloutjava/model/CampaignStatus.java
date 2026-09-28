@@ -8,6 +8,8 @@ public enum CampaignStatus {
     RUNNING,
     /** 已暂停（手动或失败率超阈值自动暂停） */
     PAUSED,
+    /** 首批结清后等待人工确认，确认前不下发后续批次 */
+    AWAITING_CONFIRMATION,
     /** 已完成全部批次 */
     COMPLETED,
     /** 已终止 */

@@ -9,6 +9,8 @@ public class UpgradeRecord {
     private final String fromVersion;
     private final String toVersion;
     private volatile UpgradeStatus status;
+    /** 失败结论的具体原因（仅 FAILED 时非空） */
+    private volatile FailureReason failureReason;
     /** 已应用的最大上报序号，用于乱序/迟到上报去重 */
     private volatile long lastAppliedSequence;
     private volatile Instant updatedAt;
@@ -29,6 +31,8 @@ public class UpgradeRecord {
     public String getToVersion() { return toVersion; }
     public UpgradeStatus getStatus() { return status; }
     public void setStatus(UpgradeStatus status) { this.status = status; }
+    public FailureReason getFailureReason() { return failureReason; }
+    public void setFailureReason(FailureReason reason) { this.failureReason = reason; }
     public long getLastAppliedSequence() { return lastAppliedSequence; }
     public void setLastAppliedSequence(long seq) { this.lastAppliedSequence = seq; }
     public Instant getUpdatedAt() { return updatedAt; }

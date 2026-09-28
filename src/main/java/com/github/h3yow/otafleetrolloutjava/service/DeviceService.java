@@ -117,13 +117,24 @@ public class DeviceService {
             record.setUpdatedAt(Instant.now());
             synchronized (device) {
                 if (request.success()) {
-                    record.setStatus(UpgradeStatus.SUCCEEDED);
-                    device.setCurrentVersion(record.getToVersion());
-                    device.setLastConfirmedVersion(record.getToVersion());
-                    device.setStatus(DeviceStatus.IDLE);
-                    device.setActiveCampaignId(null);
+                    boolean versionMatches = record.getToVersion().equals(request.reportedVersion());
+                    if (campaign.isControlled() && !versionMatches) {
+                        // 受控发布严格验收：报告成功但实际版本对不上 → 明确失败并按回滚规则恢复
+                        log.info("[Report] strict mismatch device={} reported={} target={} -> FAILED+auto-rollback",
+                                request.deviceId(), request.reportedVersion(), record.getToVersion());
+                        campaignService.failAndAutoRollback(record, device,
+                                FailureReason.REPORTED_VERSION_MISMATCH);
+                    } else {
+                        record.setFailureReason(null);
+                        record.setStatus(UpgradeStatus.SUCCEEDED);
+                        device.setCurrentVersion(record.getToVersion());
+                        device.setLastConfirmedVersion(record.getToVersion());
+                        device.setStatus(DeviceStatus.IDLE);
+                        device.setActiveCampaignId(null);
+                    }
                 } else {
                     record.setStatus(UpgradeStatus.FAILED);
+                    record.setFailureReason(FailureReason.DEVICE_REPORTED_FAILURE);
                     device.setStatus(DeviceStatus.FAILED);
                     // 保留 activeCampaignId，供回滚定位
                 }

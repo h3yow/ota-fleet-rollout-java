@@ -9,5 +9,10 @@ public enum UpgradeStatus {
     /** 设备上报升级失败 */
     FAILED,
     /** 已回滚到最近确认可用版本 */
-    ROLLED_BACK
+    ROLLED_BACK;
+
+    /** 已进入终态（不再接受会改变结论的上报） */
+    public boolean isTerminal() {
+        return this != DISPATCHED;
+    }
 }
