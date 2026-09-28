@@ -21,6 +21,12 @@ public enum RejectReason {
     ILLEGAL_CAMPAIGN_STATE,
     /** 上报序号乱序/迟到，已被更新数据覆盖 */
     STALE_REPORT,
+    /** 同一设备在同一份活动计划（可能跨批次）中重复出现 */
+    DUPLICATE_DEVICE_IN_PLAN,
+    /** 上一批尚有设备没有明确结论（未上报），不允许推进下一批 */
+    BATCH_NOT_SETTLED,
+    /** 严格验收下，设备报告成功但实际版本与目标固件不一致 */
+    TARGET_VERSION_MISMATCH,
     /** 无可回滚的历史版本 */
     NO_ROLLBACK_TARGET
 }

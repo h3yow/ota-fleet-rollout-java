@@ -2,6 +2,7 @@ package com.github.h3yow.otafleetrolloutjava.controller;
 
 import com.github.h3yow.otafleetrolloutjava.dto.CreateCampaignRequest;
 import com.github.h3yow.otafleetrolloutjava.dto.RegisterFirmwareRequest;
+import com.github.h3yow.otafleetrolloutjava.dto.rehearsal.RehearsalReport;
 import com.github.h3yow.otafleetrolloutjava.model.Campaign;
 import com.github.h3yow.otafleetrolloutjava.model.Firmware;
 import com.github.h3yow.otafleetrolloutjava.repository.FirmwareRepository;
@@ -29,6 +30,16 @@ public class CampaignController {
     @PostMapping
     public Campaign create(@RequestBody CreateCampaignRequest request) {
         return campaignService.createCampaign(request);
+    }
+
+    @PostMapping("/rehearse")
+    public RehearsalReport rehearse(@RequestBody CreateCampaignRequest request) {
+        return campaignService.rehearse(request);
+    }
+
+    @PostMapping("/{id}/confirm-first-batch")
+    public Campaign confirmFirstBatch(@PathVariable String id) {
+        return campaignService.confirmFirstBatch(id);
     }
 
     @PostMapping("/{id}/advance")

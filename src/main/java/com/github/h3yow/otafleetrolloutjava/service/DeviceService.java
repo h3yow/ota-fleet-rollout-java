@@ -117,11 +117,24 @@ public class DeviceService {
             record.setUpdatedAt(Instant.now());
             synchronized (device) {
                 if (request.success()) {
-                    record.setStatus(UpgradeStatus.SUCCEEDED);
-                    device.setCurrentVersion(record.getToVersion());
-                    device.setLastConfirmedVersion(record.getToVersion());
-                    device.setStatus(DeviceStatus.IDLE);
-                    device.setActiveCampaignId(null);
+                    if (campaign.isControlled()
+                            && !record.getToVersion().equals(request.reportedVersion())) {
+                        // 受控发布严格验收：报告成功但实际版本对不上，不得放行，记为明确失败
+                        record.setStatus(UpgradeStatus.FAILED);
+                        record.setFailureReason(RejectReason.TARGET_VERSION_MISMATCH);
+                        device.setStatus(DeviceStatus.FAILED);
+                        log.warn("[Report] strict acceptance mismatch device={} campaign={} reported={} expected={} -> FAILED, auto rollback",
+                                request.deviceId(), request.campaignId(),
+                                request.reportedVersion(), record.getToVersion());
+                        // 同线程重入 record/device 锁，按既有回滚规则回到最近确认可用版本
+                        campaignService.rollbackDeviceInternal(request.campaignId(), request.deviceId());
+                    } else {
+                        record.setStatus(UpgradeStatus.SUCCEEDED);
+                        device.setCurrentVersion(record.getToVersion());
+                        device.setLastConfirmedVersion(record.getToVersion());
+                        device.setStatus(DeviceStatus.IDLE);
+                        device.setActiveCampaignId(null);
+                    }
                 } else {
                     record.setStatus(UpgradeStatus.FAILED);
                     device.setStatus(DeviceStatus.FAILED);

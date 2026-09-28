@@ -1,5 +1,7 @@
 package com.github.h3yow.otafleetrolloutjava.model;
 
+import com.github.h3yow.otafleetrolloutjava.exception.RejectReason;
+
 import java.time.Instant;
 
 /** 单设备在某活动中的升级记录（用于幂等计数与状态机） */
@@ -11,6 +13,8 @@ public class UpgradeRecord {
     private volatile UpgradeStatus status;
     /** 已应用的最大上报序号，用于乱序/迟到上报去重 */
     private volatile long lastAppliedSequence;
+    /** 失败结论的来源（设备自报失败 / 严格验收版本对不上），非失败记录为 null */
+    private volatile RejectReason failureReason;
     private volatile Instant updatedAt;
 
     public UpgradeRecord(String deviceId, String campaignId, String fromVersion, String toVersion) {
@@ -31,6 +35,8 @@ public class UpgradeRecord {
     public void setStatus(UpgradeStatus status) { this.status = status; }
     public long getLastAppliedSequence() { return lastAppliedSequence; }
     public void setLastAppliedSequence(long seq) { this.lastAppliedSequence = seq; }
+    public RejectReason getFailureReason() { return failureReason; }
+    public void setFailureReason(RejectReason failureReason) { this.failureReason = failureReason; }
     public Instant getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(Instant t) { this.updatedAt = t; }
 }
