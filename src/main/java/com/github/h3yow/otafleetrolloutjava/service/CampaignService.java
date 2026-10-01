@@ -217,6 +217,8 @@ public class CampaignService {
                         "campaign not awaiting first-batch confirmation, current=" + campaign.getStatus());
             }
             campaign.setStatus(CampaignStatus.RUNNING);
+            // 确认一旦给出即持久保持：暂停/恢复以及报告触发的重新评估都不能把它抹掉
+            campaign.setFirstBatchConfirmed(true);
             log.info("[Campaign] first-batch confirmation received id={}, ready to advance", campaignId);
             return campaign;
         }
@@ -380,9 +382,11 @@ public class CampaignService {
             if (!isBatchSettled(campaign, current)) {
                 return;
             }
-            // 当前批次结清：还有后续批次时，先判断是否需要停在首批确认点
+            // 当前批次结清：还有后续批次时，先判断是否需要停在首批确认点；
+            // 已经给出的人工确认不被暂停/恢复或报告重评抹掉，确认后保持可推进状态
             if (current < campaign.getBatches().size() - 1) {
-                if (current == 0 && campaign.isRequireConfirmationAfterFirstBatch()) {
+                if (current == 0 && campaign.isRequireConfirmationAfterFirstBatch()
+                        && !campaign.isFirstBatchConfirmed()) {
                     campaign.setStatus(CampaignStatus.AWAITING_CONFIRMATION);
                     log.info("[Campaign] awaiting first-batch confirmation id={}", campaign.getCampaignId());
                 }

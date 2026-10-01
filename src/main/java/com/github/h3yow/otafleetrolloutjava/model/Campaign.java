@@ -19,6 +19,8 @@ public class Campaign {
     private volatile int currentBatchIndex;
     /** 是否因失败率超阈值而自动暂停 */
     private volatile boolean autoPaused;
+    /** 首批人工确认是否已经给出；该确认一旦给出，不被暂停/恢复等动作抹掉 */
+    private volatile boolean firstBatchConfirmed;
 
     public Campaign(String campaignId, String targetFirmwareVersion,
                     List<List<String>> batches, double failureThresholdPercent) {
@@ -50,4 +52,6 @@ public class Campaign {
     public void setCurrentBatchIndex(int i) { this.currentBatchIndex = i; }
     public boolean isAutoPaused() { return autoPaused; }
     public void setAutoPaused(boolean autoPaused) { this.autoPaused = autoPaused; }
+    public boolean isFirstBatchConfirmed() { return firstBatchConfirmed; }
+    public void setFirstBatchConfirmed(boolean firstBatchConfirmed) { this.firstBatchConfirmed = firstBatchConfirmed; }
 }
