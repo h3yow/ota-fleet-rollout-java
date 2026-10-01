@@ -30,6 +30,11 @@
    调用 `POST /api/campaigns/{id}/confirm-first-batch` 后回到 `RUNNING`，仍需再调用 `advance`
    才下发第二批。重复确认、并发确认、确认与推进并发时，同一批设备只可能下发一次
    （活动对象锁串行化，确认点只有一次成功迁移）。
+   - **确认结论是持久的，不会被暂停/恢复抹掉**：确认给出后（含尚未推进第二批时）若有人
+     `pause` 再 `resume`，活动恢复后仍是 `RUNNING`，可直接 `advance`，**不会**退回
+     `AWAITING_CONFIRMATION`，也不要求再次确认；重复确认一律被拒绝。
+   - 暂停/恢复本身仍保持原语义：只有 `RUNNING` 能暂停、只有 `PAUSED` 能恢复；
+     等待确认期间既不能暂停也不能推进，三种停住状态继续可区分。
 6. **回滚 / 终止 / 暂停** 维持既有规则。
 
 ## 受控发布的严格验收
@@ -49,7 +54,8 @@
 - **Device**：`deviceId / platform / currentVersion / lastConfirmedVersion / status / activeCampaignId`
 - **Firmware**：`version / platform / minSourceVersion / checksum`，`minSourceVersion` 为可升级的最低源版本约束
 - **Campaign**：分批灰度活动，`batches` 为设备分组，`failureThresholdPercent` 为失败率阈值，
-  `controlled` 为受控发布开关，`requireConfirmationAfterFirstBatch` 为首批确认点开关
+  `controlled` 为受控发布开关，`requireConfirmationAfterFirstBatch` 为首批确认点开关，
+  `firstBatchConfirmed` 记录首批确认是否已给出（一经置位，暂停/恢复均不清除）
 - **UpgradeRecord**：单设备在某活动中的升级记录，`lastAppliedSequence` 用于上报去重与乱序判定，
   `failureReason` 区分设备自报失败与严格验收版本对不上
 
@@ -72,10 +78,14 @@ DISPATCHED --(有效成功上报)--> SUCCEEDED
 ### 活动状态（CampaignStatus）
 ```
 CREATED --(advance)--> RUNNING --(pause/失败率超阈值)--> PAUSED --(resume)--> RUNNING
-RUNNING --(首批结清且配置了确认点)--> AWAITING_CONFIRMATION --(confirm-first-batch)--> RUNNING
+RUNNING --(首批结清且配置了确认点且尚未确认)--> AWAITING_CONFIRMATION --(confirm-first-batch)--> RUNNING
 RUNNING --(所有批次下发且全部记录终态)--> COMPLETED
 CREATED/RUNNING/PAUSED/AWAITING_CONFIRMATION --(terminate)--> TERMINATED
 ```
+
+> 首批确认只可能发生一次。确认后若经历 `pause`/`resume`（在确认后任意时刻，包括第二批下发前后），
+> 恢复结果始终是 `RUNNING`，绝不会重新进入 `AWAITING_CONFIRMATION`；恢复后直接 `advance`
+> 即可继续。未配置首批确认点的活动不涉及确认态，行为与旧版本完全一致。
 
 三种“停住”状态可明确区分：
 
@@ -84,6 +94,10 @@ CREATED/RUNNING/PAUSED/AWAITING_CONFIRMATION --(terminate)--> TERMINATED
 | `PAUSED` + `autoPaused=false` | 人工暂停 | `resume` |
 | `PAUSED` + `autoPaused=true` | 触发失败率停下条件 | 必须人工 `resume`，期间禁止推进 |
 | `AWAITING_CONFIRMATION` | 首批已结清，等待发布负责人确认 | `confirm-first-batch` 后再 `advance` |
+
+区分要点：等待确认期间 `pause`/`advance`/重复 `confirm` 都被拒绝（只能确认）；确认通过后再手动
+暂停，状态是 `PAUSED` + `autoPaused=false`（与普通手动暂停同形），但活动上已持久化确认结论，
+`resume` 后直接是 `RUNNING`，不会退回等待确认。
 
 ## 灰度与回滚规则
 
@@ -100,8 +114,10 @@ CREATED/RUNNING/PAUSED/AWAITING_CONFIRMATION --(terminate)--> TERMINATED
    （失败与已回滚均计入失败），超过阈值即自动暂停（`PAUSED` + `autoPaused=true`），
    暂停状态下 `advance` 被拒绝，需人工 `resume`。失败率停下优先于首批等待确认。
 6. **分批门禁**：推进下一批前上一批必须全部结清（见“发布流程”）。
-7. **并发一致性**：批次推进、首批确认按活动对象加锁串行化；上报按记录对象加锁，
-   并发重复上报恰好生效一次；并发重复确认恰好放行一次。
+7. **并发一致性**：批次推进、首批确认、暂停、恢复均按活动对象加锁串行化；上报按记录对象加锁，
+   并发重复上报恰好生效一次；并发重复确认恰好放行一次。确认与暂停/恢复/推进并发交叉时，
+   同一批设备也只可能成功下发一次（推进以 `currentBatchIndex` 前移为准，重复推进拿不到第二批），
+   不产生重复下发记录或重复计数，且已给出的确认不会被任何暂停/恢复序列重置。
 8. **失败回滚**：仅 `FAILED` 记录可回滚，回滚目标为设备 `lastConfirmedVersion`
    （最近一次确认可用版本）；回滚后设备释放，`GET /api/devices/version-distribution`
    可准确查询机群版本分布。严格验收版本对不上时该回滚自动完成。
@@ -135,10 +151,17 @@ CREATED/RUNNING/PAUSED/AWAITING_CONFIRMATION --(terminate)--> TERMINATED
 
 ```bash
 # 运行全部测试（含彩排无副作用、阻塞原因区分、严格验收版本对不上、
-# 上一批未结清拒绝推进、首批等待确认、并发重复确认，
+# 上一批未结清拒绝推进、首批等待确认、并发重复确认、
+# 首批确认后暂停再恢复仍可直接推进（确认不被重置）、
+# 确认与暂停/恢复/推进交叉只下发一次，
 # 以及重复/乱序上报、回滚、失败率暂停、版本分布回归用例；
 # 日志会打印关键输入与判定依据）
 mvn test
+
+# 只跑“确认 -> 暂停 -> 恢复 -> 推进”完整链路用例
+mvn test -Dtest='ReleaseFlowTest#firstBatchConfirmationSurvivesPauseAndResume'
+# 只跑确认与暂停/恢复/推进并发交叉的边界用例
+mvn test -Dtest='ReleaseFlowTest#confirmationInterleavedWithPauseResumeAndAdvanceDispatchesOnce'
 
 # 启动服务
 mvn spring-boot:run
@@ -159,6 +182,24 @@ curl -X POST localhost:8080/api/campaigns/camp-1/advance
 curl -X POST localhost:8080/api/devices/report -H 'Content-Type: application/json' \
   -d '{"deviceId":"dev-1","campaignId":"camp-1","sequence":1,"success":true,"reportedVersion":"2.0.0","platform":"linux-arm64"}'
 curl localhost:8080/api/devices/version-distribution
+
+# 验证“首批确认后暂停再恢复”：两批次活动，首批结清 -> 确认 -> 暂停 -> 恢复 -> 推进第二批
+curl -X POST localhost:8080/api/devices/register -H 'Content-Type: application/json' \
+  -d '{"deviceId":"dev-2","platform":"linux-arm64","initialVersion":"1.0.0"}'
+curl -X POST localhost:8080/api/campaigns -H 'Content-Type: application/json' \
+  -d '{"campaignId":"camp-2","targetFirmwareVersion":"2.0.0","batches":[["dev-1"],["dev-2"]],
+       "failureThresholdPercent":100,"controlled":false,"requireConfirmationAfterFirstBatch":true}'
+curl -X POST localhost:8080/api/campaigns/camp-2/advance
+curl -X POST localhost:8080/api/devices/report -H 'Content-Type: application/json' \
+  -d '{"deviceId":"dev-1","campaignId":"camp-2","sequence":1,"success":true,"reportedVersion":"2.0.0","platform":"linux-arm64"}'
+# 此时状态为 AWAITING_CONFIRMATION；下面的 advance 会被 409 拒绝
+curl -X POST localhost:8080/api/campaigns/camp-2/advance
+curl -X POST localhost:8080/api/campaigns/camp-2/confirm-first-batch   # -> RUNNING
+curl -X POST localhost:8080/api/campaigns/camp-2/pause                 # -> PAUSED（autoPaused=false）
+curl -X POST localhost:8080/api/campaigns/camp-2/advance               # 暂停中推进：409 拒绝
+curl -X POST localhost:8080/api/campaigns/camp-2/resume                # -> RUNNING，不是 AWAITING_CONFIRMATION
+curl -X POST localhost:8080/api/campaigns/camp-2/confirm-first-batch   # 重复确认：409 拒绝
+curl -X POST localhost:8080/api/campaigns/camp-2/advance               # 第二批正常下发，只下发一次
 ```
 
 ## 测试覆盖
@@ -169,5 +210,7 @@ curl localhost:8080/api/devices/version-distribution
   平台/版本兼容约束、设备活动互斥、混合结果下的机群版本分布
 - `ReleaseFlowTest`：彩排可行/失败均无副作用、五类阻塞原因可区分、
   严格验收版本对不上即失败并自动回滚、非受控行为不变、上一批未结清拒绝推进、
-  首批等待确认与三种停住状态区分、并发重复确认与确认后推进只下发一次
+  首批等待确认与三种停住状态区分、并发重复确认与确认后推进只下发一次、
+  首批确认后暂停再恢复仍保持可推进（确认不被重置）、
+  确认与暂停/恢复/推进并发交叉时同一批恰好下发一次
 - `ReleaseFlowHttpTest`：彩排端点返回明细、旧创建 JSON 缺省新字段仍可创建（兼容性）

@@ -121,6 +121,17 @@ class ReleaseFlowTest {
                 "pre-existing occupation must remain untouched");
     }
 
+    private static void awaitQuietly(java.util.concurrent.CyclicBarrier barrier) {
+        try {
+            barrier.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        } catch (java.util.concurrent.BrokenBarrierException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private static void assertBlocked(BatchPlan batch, String deviceId, RejectReason reason) {
         var match = batch.blockedDevices().stream()
                 .filter(b -> b.deviceId().equals(deviceId)).findFirst().orElseThrow();
@@ -275,6 +286,183 @@ class ReleaseFlowTest {
         Campaign paused = campaignRepo.findById("camp-pause").orElseThrow();
         assertEquals(CampaignStatus.PAUSED, paused.getStatus());
         assertFalse(paused.isAutoPaused(), "manual pause must be PAUSED with autoPaused=false");
+    }
+
+    @Test
+    void firstBatchConfirmationSurvivesPauseAndResume() {
+        deviceService.register(new RegisterDeviceRequest("dev-pa0", "linux-arm64", "1.0.0"));
+        deviceService.register(new RegisterDeviceRequest("dev-pa1", "linux-arm64", "1.0.0"));
+        campaignService.createCampaign(new CreateCampaignRequest(
+                "camp-pa", "2.0.0",
+                List.of(List.of("dev-pa0"), List.of("dev-pa1")), 100.0, false, true));
+        campaignService.advance("camp-pa");
+        deviceService.reportUpgradeResult(new ReportUpgradeRequest(
+                "dev-pa0", "camp-pa", 1L, true, "2.0.0", "linux-arm64"));
+        assertEquals(CampaignStatus.AWAITING_CONFIRMATION,
+                campaignRepo.findById("camp-pa").orElseThrow().getStatus());
+
+        // 人工确认通过
+        campaignService.confirmFirstBatch("camp-pa");
+        Campaign confirmed = campaignRepo.findById("camp-pa").orElseThrow();
+        assertEquals(CampaignStatus.RUNNING, confirmed.getStatus());
+        assertTrue(confirmed.isFirstBatchConfirmed(), "confirmation must be recorded on the campaign");
+
+        // 确认后、推进前，有人手动暂停
+        campaignService.pause("camp-pa");
+        Campaign paused = campaignRepo.findById("camp-pa").orElseThrow();
+        assertEquals(CampaignStatus.PAUSED, paused.getStatus());
+        assertFalse(paused.isAutoPaused(), "manual pause must not be mistaken for failure stop");
+        // 关键回归点：暂停不能抹掉确认结论
+        assertTrue(paused.isFirstBatchConfirmed(), "pause must not clear the first-batch confirmation");
+
+        // 暂停期间推进仍被明确拦截
+        RejectedException blockedWhilePaused = assertThrows(RejectedException.class,
+                () -> campaignService.advance("camp-pa"));
+        assertEquals(RejectReason.ILLEGAL_CAMPAIGN_STATE, blockedWhilePaused.getReason());
+        assertTrue(blockedWhilePaused.getMessage().contains("paused"));
+
+        // 恢复：必须回到 RUNNING 而不是 AWAITING_CONFIRMATION
+        campaignService.resume("camp-pa");
+        Campaign resumed = campaignRepo.findById("camp-pa").orElseThrow();
+        log.info("[Test] after resume: status={} confirmed={} batchIndex={}",
+                resumed.getStatus(), resumed.isFirstBatchConfirmed(), resumed.getCurrentBatchIndex());
+        assertEquals(CampaignStatus.RUNNING, resumed.getStatus(),
+                "resume must not send a confirmed campaign back to awaiting-confirmation");
+        assertTrue(resumed.isFirstBatchConfirmed());
+
+        // 恢复后重复确认仍被拒绝（确认点已经消费过）
+        RejectedException reconfirm = assertThrows(RejectedException.class,
+                () -> campaignService.confirmFirstBatch("camp-pa"));
+        assertEquals(RejectReason.ILLEGAL_CAMPAIGN_STATE, reconfirm.getReason());
+
+        // 恢复后可直接推进第二批，且只下发一次
+        campaignService.advance("camp-pa");
+        assertEquals(1, campaignRepo.findById("camp-pa").orElseThrow().getCurrentBatchIndex());
+        assertEquals(DeviceStatus.UPGRADING,
+                deviceRepo.findById("dev-pa1").orElseThrow().getStatus());
+        assertEquals(1, recordRepo.findByCampaign("camp-pa").stream()
+                .filter(r -> r.getDeviceId().equals("dev-pa1")).count(),
+                "second-batch device must have exactly one dispatch record");
+        assertEquals(1, recordRepo.findByCampaign("camp-pa").stream()
+                .filter(r -> r.getDeviceId().equals("dev-pa0")).count(),
+                "first-batch device must still have exactly one record");
+
+        // 再暂停/恢复一次（第二批在途），确认结论依旧有效，状态不回退
+        campaignService.pause("camp-pa");
+        campaignService.resume("camp-pa");
+        assertEquals(CampaignStatus.RUNNING,
+                campaignRepo.findById("camp-pa").orElseThrow().getStatus());
+    }
+
+    @Test
+    void confirmationInterleavedWithPauseResumeAndAdvanceDispatchesOnce() throws Exception {
+        deviceService.register(new RegisterDeviceRequest("dev-ix0", "linux-arm64", "1.0.0"));
+        deviceService.register(new RegisterDeviceRequest("dev-ix1", "linux-arm64", "1.0.0"));
+        campaignService.createCampaign(new CreateCampaignRequest(
+                "camp-ix", "2.0.0",
+                List.of(List.of("dev-ix0"), List.of("dev-ix1")), 100.0, false, true));
+        campaignService.advance("camp-ix");
+        deviceService.reportUpgradeResult(new ReportUpgradeRequest(
+                "dev-ix0", "camp-ix", 1L, true, "2.0.0", "linux-arm64"));
+        assertEquals(CampaignStatus.AWAITING_CONFIRMATION,
+                campaignRepo.findById("camp-ix").orElseThrow().getStatus());
+
+        int confirmThreads = 8;
+        int advanceThreads = 8;
+        int flickerThreads = 4;
+        int iterations = 50;
+        java.util.concurrent.atomic.AtomicInteger confirmedOk = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger advancedOk = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.CyclicBarrier barrier =
+                new java.util.concurrent.CyclicBarrier(confirmThreads + advanceThreads + flickerThreads);
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(confirmThreads + advanceThreads + flickerThreads);
+        List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>();
+
+        // 确认者：重复/并发确认，最终只能有一次成功
+        for (int i = 0; i < confirmThreads; i++) {
+            futures.add(pool.submit(() -> {
+                awaitQuietly(barrier);
+                for (int k = 0; k < iterations; k++) {
+                    try {
+                        campaignService.confirmFirstBatch("camp-ix");
+                        confirmedOk.incrementAndGet();
+                    } catch (RejectedException ignored) {
+                        // 未到确认点 / 确认点已被他人消费：预期拒绝
+                    }
+                }
+            }));
+        }
+        // 推进者：与确认/暂停/恢复交叉，尝试推进第二批
+        for (int i = 0; i < advanceThreads; i++) {
+            futures.add(pool.submit(() -> {
+                awaitQuietly(barrier);
+                for (int k = 0; k < iterations; k++) {
+                    try {
+                        campaignService.advance("camp-ix");
+                        advancedOk.incrementAndGet();
+                    } catch (RejectedException ignored) {
+                        // 等待确认/暂停中/无更多批次：预期拒绝
+                    }
+                }
+            }));
+        }
+        // 暂停/恢复抖动者：随时打断，验证确认结论不被抹掉
+        for (int i = 0; i < flickerThreads; i++) {
+            futures.add(pool.submit(() -> {
+                awaitQuietly(barrier);
+                for (int k = 0; k < iterations; k++) {
+                    try {
+                        campaignService.pause("camp-ix");
+                    } catch (RejectedException ignored) {
+                        // 非 RUNNING 时暂停被拒绝：预期
+                    }
+                    try {
+                        campaignService.resume("camp-ix");
+                    } catch (RejectedException ignored) {
+                        // 非 PAUSED 时恢复被拒绝：预期
+                    }
+                }
+            }));
+        }
+        for (var f : futures) {
+            f.get(30, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        pool.shutdown();
+
+        log.info("[Test] interleaved phase: confirmedOk={} advancedOk={} status={} batchIndex={}",
+                confirmedOk.get(), advancedOk.get(),
+                campaignRepo.findById("camp-ix").orElseThrow().getStatus(),
+                campaignRepo.findById("camp-ix").orElseThrow().getCurrentBatchIndex());
+
+        // 无论交叉顺序如何，确认只能生效一次
+        assertEquals(1, confirmedOk.get(), "confirmation must take effect exactly once under concurrency");
+
+        // 交叉阶段结束后在主线程把状态归一化，再推进到最终批次；全程成功推进总数必须恰好 1
+        Campaign campaign = campaignRepo.findById("camp-ix").orElseThrow();
+        if (campaign.getStatus() == CampaignStatus.PAUSED) {
+            campaignService.resume("camp-ix");
+            campaign = campaignRepo.findById("camp-ix").orElseThrow();
+        }
+        if (campaign.getCurrentBatchIndex() < 1) {
+            // 交叉阶段第二批尚未下发：此时绝不能还停在等待确认
+            assertEquals(CampaignStatus.RUNNING, campaign.getStatus(),
+                    "confirmed campaign must never return to awaiting-confirmation after pause/resume");
+            campaignService.advance("camp-ix");
+            advancedOk.incrementAndGet();
+        }
+
+        campaign = campaignRepo.findById("camp-ix").orElseThrow();
+        assertEquals(1, campaign.getCurrentBatchIndex());
+        assertEquals(CampaignStatus.RUNNING, campaign.getStatus());
+        assertEquals(1, advancedOk.get(), "second batch must dispatch exactly once across all threads");
+        assertEquals(1, recordRepo.findByCampaign("camp-ix").stream()
+                .filter(r -> r.getDeviceId().equals("dev-ix1")).count(),
+                "no duplicate dispatch records under interleaved confirm/pause/resume/advance");
+        assertEquals(1, recordRepo.findByCampaign("camp-ix").stream()
+                .filter(r -> r.getDeviceId().equals("dev-ix0")).count());
+        assertEquals(DeviceStatus.UPGRADING,
+                deviceRepo.findById("dev-ix1").orElseThrow().getStatus());
     }
 
     @Test

@@ -217,6 +217,9 @@ public class CampaignService {
                         "campaign not awaiting first-batch confirmation, current=" + campaign.getStatus());
             }
             campaign.setStatus(CampaignStatus.RUNNING);
+            // 确认结论持久化在活动上：之后的手动暂停/恢复都不能抹掉它，
+            // resume -> maybeComplete 不得再把活动退回 AWAITING_CONFIRMATION
+            campaign.setFirstBatchConfirmed(true);
             log.info("[Campaign] first-batch confirmation received id={}, ready to advance", campaignId);
             return campaign;
         }
@@ -382,7 +385,8 @@ public class CampaignService {
             }
             // 当前批次结清：还有后续批次时，先判断是否需要停在首批确认点
             if (current < campaign.getBatches().size() - 1) {
-                if (current == 0 && campaign.isRequireConfirmationAfterFirstBatch()) {
+                if (current == 0 && campaign.isRequireConfirmationAfterFirstBatch()
+                        && !campaign.isFirstBatchConfirmed()) {
                     campaign.setStatus(CampaignStatus.AWAITING_CONFIRMATION);
                     log.info("[Campaign] awaiting first-batch confirmation id={}", campaign.getCampaignId());
                 }
